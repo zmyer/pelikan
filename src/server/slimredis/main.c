@@ -1,3 +1,4 @@
+#include "admin/process.h"
 #include "setting.h"
 #include "stats.h"
 
@@ -8,15 +9,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdio.h>
-#include <string.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sysexits.h>
 
 struct data_processor worker_processor = {
-    slimcache_process_read,
-    slimcache_process_write,
-    slimcache_process_error
+    slimredis_process_read,
+    slimredis_process_write,
+    slimredis_process_error,
 };
 
 static void
@@ -24,18 +24,14 @@ show_usage(void)
 {
     log_stdout(
             "Usage:" CRLF
-            "  pelikan_slimcache [option|config]" CRLF
+            "  pelikan_slimredis [option|config]" CRLF
             );
     log_stdout(
             "Description:" CRLF
-            "  pelikan_slimcache is one of the unified cache backends. " CRLF
-            "  It uses cuckoo hashing to efficiently store small key/val " CRLF
-            "  pairs. It speaks the memcached ASCII protocol and supports " CRLF
-            "  most ASCII memcached commands, except prepend/append. " CRLF
-            CRLF
-            "  The storage in slimcache is preallocated as a hash table. " CRLF
-            "  Therefore, maximum key+val size has to be specified when " CRLF
-            "  starting the service, and cannot be updated dynamically." CRLF
+            "  pelikan_slimredis is one of the unified cache backends. " CRLF
+            "  It uses managed storage backends to cache key/val pairs. " CRLF
+            "  It speaks the memcached ASCII protocol and supports almost " CRLF
+            "  all ASCII memcached commands." CRLF
             );
     log_stdout(
             "Command-line options:" CRLF
@@ -46,7 +42,7 @@ show_usage(void)
             );
     log_stdout(
             "Example:" CRLF
-            "  pelikan_slimcache slimcache.conf" CRLF CRLF
+            "  pelikan_slimredis slimredis.conf" CRLF CRLF
             "Sample config files can be found under the config dir." CRLF
             );
 }
@@ -59,8 +55,6 @@ teardown(void)
     core_admin_teardown();
     admin_process_teardown();
     process_teardown();
-    cuckoo_teardown();
-    klog_teardown();
     compose_teardown();
     parse_teardown();
     response_teardown();
@@ -92,16 +86,16 @@ setup(void)
 
     /* Setup logging first */
     log_setup(&stats.log);
-    if (debug_setup(&setting.debug) < 0) {
+    if (debug_setup(&setting.debug) != CC_OK) {
         log_stderr("debug log setup failed");
-        goto error;
+        exit(EX_CONFIG);
     }
 
     /* setup top-level application options */
-    if (option_bool(&setting.slimcache.daemonize)) {
+    if (option_bool(&setting.slimredis.daemonize)) {
         daemonize();
     }
-    fname = option_str(&setting.slimcache.pid_filename);
+    fname = option_str(&setting.slimredis.pid_filename);
     if (fname != NULL) {
         /* to get the correct pid, call create_pidfile after daemonize */
         create_pidfile(fname);
@@ -122,8 +116,6 @@ setup(void)
     response_setup(&setting.response, &stats.response);
     parse_setup(&stats.parse_req, NULL);
     compose_setup(NULL, &stats.compose_rsp);
-    klog_setup(&setting.klog, &stats.klog);
-    cuckoo_setup(&setting.cuckoo, &stats.cuckoo);
     process_setup(&setting.process, &stats.process);
     admin_process_setup();
     core_admin_setup(&setting.admin);
@@ -131,15 +123,9 @@ setup(void)
     core_worker_setup(&setting.worker, &stats.worker);
 
     /* adding recurring events to maintenance/admin thread */
-    intvl = option_uint(&setting.slimcache.dlog_intvl);
+    intvl = option_uint(&setting.slimredis.dlog_intvl);
     if (core_admin_register(intvl, debug_log_flush, NULL) == NULL) {
         log_stderr("Could not register timed event to flush debug log");
-        goto error;
-    }
-
-    intvl = option_uint(&setting.slimcache.klog_intvl);
-    if (core_admin_register(intvl, klog_flush, NULL) == NULL) {
-        log_error("Could not register timed event to flush command log");
         goto error;
     }
 
@@ -157,7 +143,7 @@ error:
 int
 main(int argc, char **argv)
 {
-    rstatus_i status = CC_OK;
+    rstatus_i status = CC_OK;;
     FILE *fp = NULL;
 
     if (argc > 2) {
@@ -167,9 +153,8 @@ main(int argc, char **argv)
 
     if (argc == 1) {
         log_stderr("launching server with default values.");
-    }
-
-    if (argc == 2) {
+    } else {
+        /* argc == 2 */
         if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
             show_usage();
             exit(EX_OK);

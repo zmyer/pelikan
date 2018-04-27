@@ -21,12 +21,6 @@ typedef enum put_rstatus {
     PUT_ERROR,
 } put_rstatus_t;
 
-/* the data pointer in the process functions is of type `struct data **' */
-struct data {
-    struct request *req;
-    struct response *rsp;
-};
-
 static bool process_init = false;
 static process_metrics_st *process_metrics = NULL;
 static bool allow_flush = ALLOW_FLUSH;
@@ -626,66 +620,48 @@ _cleanup(struct request *req, struct response *rsp)
         response_return_all(&nr);
     }
     response_reset(rsp);
-}
-
-static inline struct data *
-_data_create(void)
-{
-    struct data *data;
-    struct request *req;
-    struct response *rsp;
-
-    req = request_borrow();
-    rsp = response_borrow();
-    data = cc_alloc(sizeof(struct data));
-
-    if (req == NULL || rsp == NULL || data == NULL) {
-        request_return(&req);
-        response_return(&rsp);
-        cc_free(data); /* cc_free(data) is a macro that sets data to NULL */
-    } else {
-        data->req = req;
-        data->rsp = rsp;
-    }
-
-    return data;
+    req->rsp = rsp;
 }
 
 int
-twemcache_process_read(struct buf_sock *s)
+twemcache_process_read(struct buf **rbuf, struct buf **wbuf, void **data)
 {
     parse_rstatus_t status;
-    struct data *state;
-    struct request *req;
+    struct request *req; /* data should be NULL or hold a req pointer */
     struct response *rsp;
 
     log_verb("post-read processing");
 
     /* deal with the stateful part: request and response */
-    if (s->data == NULL) {
-        if ((s->data = _data_create()) == NULL) {
-            /* TODO(yao): simply return for now, better to respond with OOM */
-            log_error("cannot process request: OOM");
-            INCR(process_metrics, process_ex);
+    req = (*data != NULL) ? *data : request_borrow();
+    if (req  == NULL) {
+        /* TODO(yao): simply return for now, better to respond with OOM */
+        log_error("cannot process request: OOM");
+        INCR(process_metrics, process_ex);
 
-            return -1;
-        }
+        return -1;
     }
-    state = (struct data *)s->data;
-    req = state->req;
-    rsp = state->rsp;
+    rsp = (req->rsp != NULL) ? req->rsp : response_borrow();
+    if (rsp  == NULL) {
+        request_return(&req);
+        /* TODO(yao): simply return for now, better to respond with OOM */
+        log_error("cannot process request: OOM");
+        INCR(process_metrics, process_ex);
+
+        return -1;
+    }
 
     /* keep parse-process-compose until running out of data in rbuf */
-    while (buf_rsize(s->rbuf) > 0) {
+    while (buf_rsize(*rbuf) > 0) {
         struct response *nr;
         int i, card;
 
         /* stage 1: parsing */
-        log_verb("%"PRIu32" bytes left", buf_rsize(s->rbuf));
+        log_verb("%"PRIu32" bytes left", buf_rsize(*rbuf));
 
-        status = parse_req(req, s->rbuf);
+        status = parse_req(req, *rbuf);
         if (status == PARSE_EUNFIN) {
-            buf_lshift(s->rbuf);
+            buf_lshift(*rbuf);
             return 0;
         }
         if (status != PARSE_OK) {
@@ -732,7 +708,7 @@ twemcache_process_read(struct buf_sock *s)
         process_request(rsp, req);
         if (req->partial) { /* implies end of rbuf w/o complete processing */
             /* in this case, do not attempt to log or write response */
-            buf_lshift(s->rbuf);
+            buf_lshift(*rbuf);
             return 0;
         }
 
@@ -747,7 +723,7 @@ twemcache_process_read(struct buf_sock *s)
                 card = req->nfound + 1;
             }
             for (i = 0; i < card; nr = STAILQ_NEXT(nr, next), ++i) {
-                if (compose_rsp(&s->wbuf, nr) < 0) {
+                if (compose_rsp(wbuf, nr) < 0) {
                     log_error("composing rsp erred");
                     INCR(process_metrics, process_ex);
                     _cleanup(req, rsp);
@@ -766,44 +742,41 @@ twemcache_process_read(struct buf_sock *s)
 
 
 int
-twemcache_process_write(struct buf_sock *s)
+twemcache_process_write(struct buf **rbuf, struct buf **wbuf, void **data)
 {
     log_verb("post-write processing");
 
-    buf_lshift(s->rbuf);
-    dbuf_shrink(&s->rbuf);
-    buf_lshift(s->wbuf);
-    dbuf_shrink(&s->wbuf);
+    buf_lshift(*rbuf);
+    dbuf_shrink(rbuf);
+    buf_lshift(*wbuf);
+    dbuf_shrink(wbuf);
 
     return 0;
 }
 
 
 int
-twemcache_process_error(struct buf_sock *s)
+twemcache_process_error(struct buf **rbuf, struct buf **wbuf, void **data)
 {
-    struct data *state = (struct data *)s->data;
-    struct request *req;
+    struct request *req = *data;
     struct response *rsp;
 
     log_verb("post-error processing");
 
     /* normalize buffer size */
-    buf_reset(s->rbuf);
-    dbuf_shrink(&s->rbuf);
-    buf_reset(s->wbuf);
-    dbuf_shrink(&s->wbuf);
+    buf_reset(*rbuf);
+    dbuf_shrink(rbuf);
+    buf_reset(*wbuf);
+    dbuf_shrink(wbuf);
 
     /* release request data & associated reserved data */
-    if (state != NULL) {
-        req = state->req;
-        rsp = state->rsp;
+    if (req != NULL) {
+        rsp = req->rsp;
         if (req->reserved != NULL) {
             item_release((struct item **)&req->reserved);
         }
         request_return(&req);
         response_return_all(&rsp);
-        cc_free(state);
     }
 
     return 0;
